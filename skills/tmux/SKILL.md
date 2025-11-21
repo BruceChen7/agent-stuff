@@ -1,7 +1,7 @@
 ---
 name: tmux
 description: "Remote control tmux sessions for interactive CLIs (python, gdb, etc.) by sending keystrokes and scraping pane output."
-license: Stolen from Mario
+license: Vibecoded
 ---
 
 # tmux Skill

@@ -37,3 +37,7 @@ These are commands that do not work without tuning!  But you can put claude to t
 ## Browser
 
 In the [`skills/web-browser`](skills/web-browser) folder is a Claude Skill that helps it to use puppeteer in a node environment to browse the web.  This significantly improves on using a browser MCP.  You will need to go intot he tools folder once to run `npm i`.  This was stolen from [Mario Zechner](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/).
+
+## tmux
+
+In the [`skills/tmux`](skills/tmux) folder is a Claude Skill that lets it drive tmux directly for interactive CLI workflows (python, gdb, etc.) by sending keystrokes and scraping pane output.  It uses stock tmux on macOS/Linux and includes helper scripts in `tools` to find sessions and wait for prompts.
