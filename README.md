@@ -38,6 +38,7 @@ All skill files are in the [`skills`](skills) folder:
 * [`/tmux`](skills/tmux) - Claude Skill for driving tmux directly with keystrokes and pane output scraping
 * [`/sentry`](skills/sentry) - Alternative way to access Sentry as a Claude Skill for reading issues
 * [`/improve-skill`](skills/improve-skill) - Claude Skill for analyzing coding agent sessions to improve or create new skills
+* [`/pi-share`](skills/pi-share) - Claude Skill for loading and parsing session transcripts from shittycodingagent.ai
 
 ### Browser
 
@@ -58,6 +59,10 @@ In the [`skills/improve-skill`](skills/improve-skill) folder is a skill that hel
 ### ghidra
 
 In the [`skills/ghidra`](skills/ghidra) folder is a skill for automated reverse engineering using Ghidra's headless analyzer.  It can decompile binaries to C code, extract functions, strings, symbols, and analyze call graphs without needing the GUI.  Requires Ghidra installed (on macOS: `brew install --cask ghidra`).
+
+### pi-share
+
+In the [`skills/pi-share`](skills/pi-share) folder is a skill for loading and parsing session transcripts from shittycodingagent.ai (pi-share) URLs.  It fetches gists, decodes embedded session data, and extracts conversation history including messages, tool calls, and system prompts.
 
 ## PI Coding Agent Extensions
 
