@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawn, execSync } from "node:child_process";
-import puppeteer from "puppeteer-core";
 
 const useProfile = process.argv[2] === "--profile";
 
@@ -50,17 +49,15 @@ spawn(
   { detached: true, stdio: "ignore" },
 ).unref();
 
-// Wait for Chrome to be ready by attempting to connect
+// Wait for Chrome to be ready by checking the debugging endpoint
 let connected = false;
 for (let i = 0; i < 30; i++) {
   try {
-    const browser = await puppeteer.connect({
-      browserURL: "http://localhost:9222",
-      defaultViewport: null,
-    });
-    await browser.disconnect();
-    connected = true;
-    break;
+    const response = await fetch("http://localhost:9222/json/version");
+    if (response.ok) {
+      connected = true;
+      break;
+    }
   } catch {
     await new Promise((r) => setTimeout(r, 500));
   }
