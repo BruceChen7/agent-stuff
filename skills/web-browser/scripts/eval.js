@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import puppeteer from "puppeteer-core";
+import { connect } from "./cdp.js";
+
+const DEBUG = process.env.DEBUG === "1";
+const log = DEBUG ? (...args) => console.error("[debug]", ...args) : () => {};
 
 const code = process.argv.slice(2).join(" ");
 if (!code) {
@@ -11,45 +14,55 @@ if (!code) {
   process.exit(1);
 }
 
-const b = await puppeteer.connect({
-  browserURL: "http://localhost:9222",
-  defaultViewport: null,
-});
-
-const p = (await b.pages()).at(-1);
-
-if (!p) {
-  console.error("✗ No active tab found");
+// Global timeout
+const globalTimeout = setTimeout(() => {
+  console.error("✗ Global timeout exceeded (45s)");
   process.exit(1);
-}
-
-let result;
+}, 45000);
 
 try {
-  result = await p.evaluate((c) => {
-    const AsyncFunction = (async () => {}).constructor;
-    return new AsyncFunction(`return (${c})`)();
-  }, code);
-} catch (e) {
-  console.log("Failed to evaluate expression");
-  console.log(`  Expression: ${code}`);
-  console.log(e);
-  process.exit(1);
-}
+  log("connecting...");
+  const cdp = await connect(5000);
 
-if (Array.isArray(result)) {
-  for (let i = 0; i < result.length; i++) {
-    if (i > 0) console.log("");
-    for (const [key, value] of Object.entries(result[i])) {
+  log("getting pages...");
+  const pages = await cdp.getPages();
+  const page = pages.at(-1);
+
+  if (!page) {
+    console.error("✗ No active tab found");
+    process.exit(1);
+  }
+
+  log("attaching to page...");
+  const sessionId = await cdp.attachToPage(page.targetId);
+
+  log("evaluating...");
+  const expression = `(async () => { return (${code}); })()`;
+  const result = await cdp.evaluate(sessionId, expression);
+
+  log("formatting result...");
+  if (Array.isArray(result)) {
+    for (let i = 0; i < result.length; i++) {
+      if (i > 0) console.log("");
+      for (const [key, value] of Object.entries(result[i])) {
+        console.log(`${key}: ${value}`);
+      }
+    }
+  } else if (typeof result === "object" && result !== null) {
+    for (const [key, value] of Object.entries(result)) {
       console.log(`${key}: ${value}`);
     }
+  } else {
+    console.log(result);
   }
-} else if (typeof result === "object" && result !== null) {
-  for (const [key, value] of Object.entries(result)) {
-    console.log(`${key}: ${value}`);
-  }
-} else {
-  console.log(result);
-}
 
-await b.disconnect();
+  log("closing...");
+  cdp.close();
+  log("done");
+} catch (e) {
+  console.error("✗", e.message);
+  process.exit(1);
+} finally {
+  clearTimeout(globalTimeout);
+  setTimeout(() => process.exit(0), 100);
+}

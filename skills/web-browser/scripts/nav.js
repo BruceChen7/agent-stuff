@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import puppeteer from "puppeteer-core";
+import { connect } from "./cdp.js";
+
+const DEBUG = process.env.DEBUG === "1";
+const log = DEBUG ? (...args) => console.error("[debug]", ...args) : () => {};
 
 const url = process.argv[2];
 const newTab = process.argv[3] === "--new";
@@ -13,19 +16,50 @@ if (!url) {
   process.exit(1);
 }
 
-const b = await puppeteer.connect({
-  browserURL: "http://localhost:9222",
-  defaultViewport: null,
-});
+// Global timeout
+const globalTimeout = setTimeout(() => {
+  console.error("✗ Global timeout exceeded (45s)");
+  process.exit(1);
+}, 45000);
 
-if (newTab) {
-  const p = await b.newPage();
-  await p.goto(url, { waitUntil: "domcontentloaded" });
-  console.log("✓ Opened:", url);
-} else {
-  const p = (await b.pages()).at(-1);
-  await p.goto(url, { waitUntil: "domcontentloaded" });
-  console.log("✓ Navigated to:", url);
+try {
+  log("connecting...");
+  const cdp = await connect(5000);
+
+  log("getting pages...");
+  let targetId;
+
+  if (newTab) {
+    log("creating new tab...");
+    const { targetId: newTargetId } = await cdp.send("Target.createTarget", {
+      url: "about:blank",
+    });
+    targetId = newTargetId;
+  } else {
+    const pages = await cdp.getPages();
+    const page = pages.at(-1);
+    if (!page) {
+      console.error("✗ No active tab found");
+      process.exit(1);
+    }
+    targetId = page.targetId;
+  }
+
+  log("attaching to page...");
+  const sessionId = await cdp.attachToPage(targetId);
+
+  log("navigating...");
+  await cdp.navigate(sessionId, url);
+
+  console.log(newTab ? "✓ Opened:" : "✓ Navigated to:", url);
+
+  log("closing...");
+  cdp.close();
+  log("done");
+} catch (e) {
+  console.error("✗", e.message);
+  process.exit(1);
+} finally {
+  clearTimeout(globalTimeout);
+  setTimeout(() => process.exit(0), 100);
 }
-
-await b.disconnect();

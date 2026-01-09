@@ -44,6 +44,8 @@ spawn(
     `--user-data-dir=${process.env["HOME"]}/.cache/scraping`,
     "--profile-directory=Default",
     "--disable-search-engine-choice-screen",
+    "--no-first-run",
+    "--disable-features=ProfilePicker",
   ],
   { detached: true, stdio: "ignore" },
 ).unref();
