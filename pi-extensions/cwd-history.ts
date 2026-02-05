@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { CustomEditor } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
@@ -19,6 +20,14 @@ interface PromptEntry {
 class HistoryEditor extends CustomEditor {
 	private lockedBorder = false;
 	private _borderColor?: (text: string) => string;
+	private promptHistory: PromptEntry[] = [];
+
+	// Search mode state
+	private searchMode = false;
+	private searchQuery = "";
+	private searchResults: PromptEntry[] = [];
+	private searchIndex = -1;
+	private originalText = "";
 
 	constructor(
 		tui: ConstructorParameters<typeof CustomEditor>[0],
@@ -41,14 +50,179 @@ class HistoryEditor extends CustomEditor {
 	lockBorderColor() {
 		this.lockedBorder = true;
 	}
+
+	public setHistory(history: PromptEntry[]): void {
+		this.promptHistory = history;
+	}
+
+	override handleInput(data: string): void {
+		// Ctrl+R (0x12) enters search mode
+		if (data === "\x12" && !this.searchMode) {
+			this.enterSearchMode();
+			return;
+		}
+
+		if (this.searchMode) {
+			this.handleSearchInput(data);
+			return;
+		}
+
+		// Default behavior
+		super.handleInput(data);
+	}
+
+	private enterSearchMode(): void {
+		this.searchMode = true;
+		this.searchQuery = "";
+		this.searchResults = [];
+		this.searchIndex = -1;
+		this.originalText = this.getText();
+	}
+
+	private handleSearchInput(data: string): void {
+		const tui = (this as { _tui?: any })._tui;
+
+		// Escape: exit search, restore original text
+		if (data === "\x1b") {
+			this.exitSearchMode(false);
+			tui?.requestRender();
+			return;
+		}
+
+		// Enter: accept current match, exit search
+		if (data === "\r" || data === "\n") {
+			this.exitSearchMode(true);
+			tui?.requestRender();
+			return;
+		}
+
+		// Ctrl+G (0x07): cancel search, restore original text (like bash)
+		if (data === "\x07") {
+			this.exitSearchMode(false);
+			tui?.requestRender();
+			return;
+		}
+
+		// Ctrl+R (0x12): search for next match
+		if (data === "\x12") {
+			this.searchNext();
+			tui?.requestRender();
+			return;
+		}
+
+		// Backspace: delete search character
+		if (data === "\x7f" || data === "\x08") {
+			if (this.searchQuery.length > 0) {
+				this.searchQuery = this.searchQuery.slice(0, -1);
+				this.performSearch();
+			}
+			tui?.requestRender();
+			return;
+		}
+
+		// Regular character: add to search query
+		if (data.length === 1 && data.charCodeAt(0) >= 32) {
+			this.searchQuery += data;
+			this.performSearch();
+			tui?.requestRender();
+			return;
+		}
+
+		// Other keys: pass to default handler
+		super.handleInput(data);
+	}
+
+	private performSearch(): void {
+		if (!this.searchQuery) {
+			this.searchResults = [];
+			this.searchIndex = -1;
+			return;
+		}
+
+		// Regex + case insensitive (fd style)
+		try {
+			const regex = new RegExp(this.searchQuery, "i");
+			this.searchResults = this.promptHistory.filter(entry => regex.test(entry.text));
+			this.searchIndex = this.searchResults.length > 0 ? 0 : -1;
+		} catch {
+			this.searchResults = [];
+			this.searchIndex = -1;
+		}
+	}
+
+	private searchNext(): void {
+		if (this.searchResults.length === 0) return;
+		this.searchIndex = (this.searchIndex + 1) % this.searchResults.length;
+	}
+
+	private exitSearchMode(accept: boolean): void {
+		this.searchMode = false;
+
+		if (accept && this.searchIndex >= 0) {
+			const matched = this.searchResults[this.searchIndex];
+			this.setText(matched.text);
+		} else {
+			this.setText(this.originalText);
+		}
+
+		this.searchQuery = "";
+		this.searchResults = [];
+		this.searchIndex = -1;
+		this.originalText = "";
+	}
+
+	private highlightMatch(text: string): string {
+		if (!this.searchQuery) return text;
+		try {
+			const regex = new RegExp(`(${this.searchQuery})`, "gi");
+			return text.replace(regex, "\x1b[7m$1\x1b[27m");
+		} catch {
+			return text;
+		}
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+
+		if (this.searchMode && lines.length > 0) {
+			const searchPrompt = `(reverse-i-search)\`${this.searchQuery}': `;
+			const match = this.searchIndex >= 0 ? this.searchResults[this.searchIndex] : null;
+
+			if (match) {
+				const highlighted = this.highlightMatch(match.text);
+				const promptWidth = visibleWidth(searchPrompt);
+				const maxContentWidth = Math.max(0, width - promptWidth);
+				const truncated = truncateToWidth(highlighted, maxContentWidth, "...", false);
+				lines[lines.length - 1] = searchPrompt + truncated;
+			} else {
+				lines[lines.length - 1] = searchPrompt + "(no match)";
+			}
+
+			// Add status line
+			if (this.searchResults.length > 0) {
+				const count = this.searchResults.length;
+				lines.push(`[${this.searchIndex + 1}/${count}] hit Enter to select, Ctrl+G to cancel`);
+			} else if (this.searchQuery) {
+				lines.push("(failed)");
+			}
+		}
+
+		return lines;
+	}
 }
 
 function extractText(content: Array<{ type: string; text?: string }>): string {
-	return content
+	const text = content
 		.filter((item) => item.type === "text" && typeof item.text === "string")
 		.map((item) => item.text ?? "")
-		.join("")
-		.trim();
+		.join("");
+
+	// Filter out skill tag blocks to avoid searching system prompts
+	// Format: <skill name="..." location="...">...</skill>
+	const skillTagRegex = /<skill\s+[^>]*>[\s\S]*?<\/skill>/gi;
+	const filtered = text.replace(skillTagRegex, "");
+
+	return filtered.trim();
 }
 
 function collectUserPromptsFromEntries(entries: Array<any>): PromptEntry[] {
@@ -200,6 +374,7 @@ function setEditorHistory(pi: ExtensionAPI, ctx: ExtensionContext, history: Prom
 		for (const prompt of history) {
 			editor.addToHistory?.(prompt.text);
 		}
+		editor.setHistory(history);
 		return editor;
 	});
 }
