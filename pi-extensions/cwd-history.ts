@@ -220,7 +220,19 @@ function extractText(content: Array<{ type: string; text?: string }>): string {
 	// Filter out skill tag blocks to avoid searching system prompts
 	// Format: <skill name="..." location="...">...</skill>
 	const skillTagRegex = /<skill\s+[^>]*>[\s\S]*?<\/skill>/gi;
-	const filtered = text.replace(skillTagRegex, "");
+	let filtered = text.replace(skillTagRegex, "");
+
+	// Filter out extension-generated prompts (e.g., review guidelines from review.ts)
+	// These are system prompts injected by extensions that shouldn't appear in history search
+	const extensionPromptPatterns = [
+		/^# Review Guidelines\s*\n/i, // REVIEW_RUBRIC from review.ts
+	];
+
+	for (const pattern of extensionPromptPatterns) {
+		if (pattern.test(filtered)) {
+			return "";
+		}
+	}
 
 	return filtered.trim();
 }
