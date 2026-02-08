@@ -369,15 +369,47 @@ function inferModeFromSelection(ctx: ExtensionContext, pi: ExtensionAPI, data: M
 
 	// Only consider persisted/real modes (exclude the overlay "custom").
 	const names = orderedModeNames(data.modes);
+
+	const supportsThinking = Boolean(ctx.model?.reasoning);
+
+	// 1) If thinking is supported, require an exact match so modes can differ by thinking level.
+	if (supportsThinking) {
+		for (const name of names) {
+			const spec = data.modes[name];
+			if (!spec) continue;
+			if (spec.provider !== provider || spec.modelId !== modelId) continue;
+			if ((spec.thinkingLevel ?? undefined) !== thinkingLevel) continue;
+			return name;
+		}
+		return null;
+	}
+
+	// 2) If thinking is NOT supported by the model, the effective level will always be "off".
+	// In that case, treat thinkingLevel differences in modes.json as non-distinguishing.
+	const candidates: string[] = [];
 	for (const name of names) {
 		const spec = data.modes[name];
 		if (!spec) continue;
 		if (spec.provider !== provider || spec.modelId !== modelId) continue;
-		if ((spec.thinkingLevel ?? undefined) !== thinkingLevel) continue;
-		return name;
+		candidates.push(name);
+	}
+	if (candidates.length === 0) return null;
+
+	// Prefer a candidate that explicitly matches the effective thinking level.
+	for (const name of candidates) {
+		const spec = data.modes[name];
+		if (!spec) continue;
+		if ((spec.thinkingLevel ?? "off") === thinkingLevel) return name;
 	}
 
-	return null;
+	// Next prefer a candidate with no thinkingLevel configured.
+	for (const name of candidates) {
+		const spec = data.modes[name];
+		if (!spec) continue;
+		if (!spec.thinkingLevel) return name;
+	}
+
+	return candidates[0] ?? null;
 }
 
 type ModeRuntime = {
@@ -427,7 +459,12 @@ async function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): Promise<v
 	if (fileChanged) {
 		runtime.filePath = filePath;
 		runtime.fileMtimeMs = mtimeMs;
-		runtime.data = await loadModesFile(filePath, ctx, pi);
+
+		const loaded = await loadModesFile(filePath, ctx, pi);
+		// Normalize/ensure defaults *before* we snapshot baseline so later persistence
+		// only reflects explicit user actions ("store").
+		ensureDefaultModeEntries(loaded, ctx, pi);
+		runtime.data = loaded;
 		runtime.baseline = cloneModesFile(runtime.data);
 
 		// Reset overlay when switching projects.
@@ -436,8 +473,6 @@ async function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): Promise<v
 			runtime.lastRealMode = runtime.currentMode;
 		}
 	}
-
-	ensureDefaultModeEntries(runtime.data, ctx, pi);
 
 	// If we're not in the overlay "custom" mode, ensure currentMode is valid.
 	if (runtime.currentMode !== CUSTOM_MODE_NAME) {
@@ -472,72 +507,79 @@ async function persistRuntime(pi: ExtensionAPI, ctx: ExtensionContext): Promise<
 	});
 }
 
-async function rememberSelectionForMode(pi: ExtensionAPI, ctx: ExtensionContext, mode: string): Promise<void> {
-	// "custom" is an overlay; do not persist it.
+// We cannot reliably read the *current* model immediately after pi.setModel() in the same tick,
+// because ctx.model is a snapshot-ish view that is updated via the model_select event.
+// Track the last observed model ourselves and use it for overlays / storing.
+let lastObservedModel: { provider?: string; modelId?: string } = {};
+
+function getCurrentSelectionSpec(pi: ExtensionAPI, _ctx: ExtensionContext): ModeSpec {
+	return {
+		provider: lastObservedModel.provider,
+		modelId: lastObservedModel.modelId,
+		thinkingLevel: pi.getThinkingLevel(),
+	};
+}
+
+async function storeSelectionIntoMode(pi: ExtensionAPI, ctx: ExtensionContext, mode: string, selection: ModeSpec): Promise<void> {
+	// "custom" is an overlay; it is not persisted.
 	if (mode === CUSTOM_MODE_NAME) return;
 
 	await ensureRuntime(pi, ctx);
-	const spec = runtime.data.modes[mode] ?? (runtime.data.modes[mode] = {});
 
-	// Only update the stored model if we are actually *using* the mode's stored model.
-	// This avoids "resetting" modes when model application fails (e.g. missing API key).
-	if (ctx.model) {
-		const hasStoredModel = Boolean(spec.provider && spec.modelId);
-		const matchesStoredModel =
-			hasStoredModel && spec.provider === ctx.model.provider && spec.modelId === ctx.model.id;
-		if (!hasStoredModel || matchesStoredModel) {
-			spec.provider = ctx.model.provider;
-			spec.modelId = ctx.model.id;
-		}
+	const existingTarget = runtime.data.modes[mode] ?? {};
+	const next: ModeSpec = { ...existingTarget };
+
+	// Only overwrite fields that we can actually observe.
+	if (selection.provider && selection.modelId) {
+		next.provider = selection.provider;
+		next.modelId = selection.modelId;
 	}
+	if (selection.thinkingLevel) next.thinkingLevel = selection.thinkingLevel;
 
-	spec.thinkingLevel = pi.getThinkingLevel();
+	runtime.data.modes[mode] = next;
 	await persistRuntime(pi, ctx);
-}
-
-async function rememberCurrentSelection(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-	if (runtime.currentMode === CUSTOM_MODE_NAME) return;
-	await rememberSelectionForMode(pi, ctx, runtime.currentMode);
 }
 
 async function applyMode(pi: ExtensionAPI, ctx: ExtensionContext, mode: string): Promise<void> {
 	await ensureRuntime(pi, ctx);
 
-	const previousMode = runtime.currentMode;
-
-	// Save previous mode's selection before switching away.
-	// Never persist the overlay "custom" mode.
-	if (previousMode !== mode && previousMode !== CUSTOM_MODE_NAME) {
-		await rememberSelectionForMode(pi, ctx, previousMode);
+	// "custom" is a runtime-only overlay mode.
+	if (mode === CUSTOM_MODE_NAME) {
+		runtime.currentMode = CUSTOM_MODE_NAME;
+		customOverlay = getCurrentSelectionSpec(pi, ctx);
+		if (ctx.hasUI) requestEditorRender?.();
+		return;
 	}
 
-	if (!(mode in runtime.data.modes)) {
-		runtime.data.modes[mode] = {
-			provider: ctx.model?.provider,
-			modelId: ctx.model?.id,
-			thinkingLevel: pi.getThinkingLevel(),
-		};
+	const spec = runtime.data.modes[mode];
+	if (!spec) {
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Unknown mode: ${mode}`, "warning");
+		}
+		return;
 	}
 
 	runtime.currentMode = mode;
-	if (mode !== CUSTOM_MODE_NAME) {
-		runtime.lastRealMode = mode;
-	}
-
-	const spec = runtime.data.modes[mode] ?? {};
+	runtime.lastRealMode = mode;
+	customOverlay = null;
 
 	runtime.applying = true;
+	let modelAppliedOk = true;
 	try {
 		// Apply model
 		if (spec.provider && spec.modelId) {
 			const m = ctx.modelRegistry.find(spec.provider, spec.modelId);
 			if (m) {
 				const ok = await pi.setModel(m);
+				modelAppliedOk = ok;
 				if (!ok && ctx.hasUI) {
 					ctx.ui.notify(`No API key available for ${spec.provider}/${spec.modelId}`, "warning");
 				}
-			} else if (ctx.hasUI) {
-				ctx.ui.notify(`Mode "${mode}" references unknown model ${spec.provider}/${spec.modelId}`, "warning");
+			} else {
+				modelAppliedOk = false;
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Mode "${mode}" references unknown model ${spec.provider}/${spec.modelId}`, "warning");
+				}
 			}
 		}
 
@@ -549,8 +591,13 @@ async function applyMode(pi: ExtensionAPI, ctx: ExtensionContext, mode: string):
 		runtime.applying = false;
 	}
 
-	// Persist again to capture any clamping (thinking) or effective model.
-	await rememberSelectionForMode(pi, ctx, mode);
+	// If we couldn't apply the requested model (e.g. missing API key), switch to overlay.
+	// We do *not* treat thinking-level clamping as a failure: clamping is expected when
+	// switching between models with different thinking capabilities.
+	if (!modelAppliedOk) {
+		runtime.currentMode = CUSTOM_MODE_NAME;
+		customOverlay = getCurrentSelectionSpec(pi, ctx);
+	}
 
 	if (ctx.hasUI) {
 		requestEditorRender?.();
@@ -578,28 +625,10 @@ async function selectModeUI(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 
 		// "store": overwrite target mode with the current overlay selection (keep target color if set)
 		await ensureRuntime(pi, ctx);
-
-		const overlay: ModeSpec =
-			customOverlay ??
-			({
-				provider: ctx.model?.provider,
-				modelId: ctx.model?.id,
-				thinkingLevel: pi.getThinkingLevel(),
-			} as ModeSpec);
-
-		const existingTarget = runtime.data.modes[choice] ?? {};
-		runtime.data.modes[choice] = {
-			...existingTarget,
-			provider: overlay.provider,
-			modelId: overlay.modelId,
-			thinkingLevel: overlay.thinkingLevel,
-			// preserve existingTarget.color
-		};
-		await persistRuntime(pi, ctx);
+		const overlay = customOverlay ?? getCurrentSelectionSpec(pi, ctx);
+		await storeSelectionIntoMode(pi, ctx, choice, overlay);
 		await applyMode(pi, ctx, choice);
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Stored ${CUSTOM_MODE_NAME} into "${choice}"`, "info");
-		}
+		ctx.ui.notify(`Stored ${CUSTOM_MODE_NAME} into "${choice}"`, "info");
 		return;
 	}
 
@@ -900,8 +929,43 @@ function applyEditor(pi: ExtensionAPI, ctx: ExtensionContext) {
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("mode", {
 		description: "Select prompt mode",
-		handler: async (_args, ctx) => {
-			await selectModeUI(pi, ctx);
+		handler: async (args, ctx) => {
+			const tokens = args
+				.split(/\s+/)
+				.map((x) => x.trim())
+				.filter(Boolean);
+
+			// /mode
+			if (tokens.length === 0) {
+				await selectModeUI(pi, ctx);
+				return;
+			}
+
+			// /mode store [name]
+			if (tokens[0] === "store") {
+				await ensureRuntime(pi, ctx);
+
+				let target = tokens[1];
+				if (!target) {
+					if (!ctx.hasUI) return;
+					const names = orderedModeNames(runtime.data.modes);
+					target = await ctx.ui.select("Store current selection into mode", names);
+					if (!target) return;
+				}
+
+				if (target === CUSTOM_MODE_NAME) {
+					if (ctx.hasUI) ctx.ui.notify(`Cannot store into "${CUSTOM_MODE_NAME}"`, "warning");
+					return;
+				}
+
+				const selection = customOverlay ?? getCurrentSelectionSpec(pi, ctx);
+				await storeSelectionIntoMode(pi, ctx, target, selection);
+				if (ctx.hasUI) ctx.ui.notify(`Stored current selection into "${target}"`, "info");
+				return;
+			}
+
+			// /mode <name>
+			await applyMode(pi, ctx, tokens[0]!);
 		},
 	});
 
@@ -920,6 +984,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		lastObservedModel = { provider: ctx.model?.provider, modelId: ctx.model?.id };
 		await ensureRuntime(pi, ctx);
 		customOverlay = null;
 
@@ -930,17 +995,14 @@ export default function (pi: ExtensionAPI) {
 		} else {
 			// No exact match → treat as overlay.
 			runtime.currentMode = CUSTOM_MODE_NAME;
-			customOverlay = {
-				provider: ctx.model?.provider,
-				modelId: ctx.model?.id,
-				thinkingLevel: pi.getThinkingLevel(),
-			};
+			customOverlay = getCurrentSelectionSpec(pi, ctx);
 		}
 
 		applyEditor(pi, ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		lastObservedModel = { provider: ctx.model?.provider, modelId: ctx.model?.id };
 		await ensureRuntime(pi, ctx);
 		customOverlay = null;
 
@@ -950,25 +1012,19 @@ export default function (pi: ExtensionAPI) {
 			runtime.lastRealMode = inferred;
 		} else {
 			runtime.currentMode = CUSTOM_MODE_NAME;
-			customOverlay = {
-				provider: ctx.model?.provider,
-				modelId: ctx.model?.id,
-				thinkingLevel: pi.getThinkingLevel(),
-			};
+			customOverlay = getCurrentSelectionSpec(pi, ctx);
 		}
 
 		applyEditor(pi, ctx);
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
-		// Capture current thinking/model so each mode remembers its last selection.
-		await rememberCurrentSelection(pi, ctx);
-	});
 
 	pi.on("model_select", async (event: ModelSelectEvent, ctx) => {
-		// Skip updates triggered by applyMode() itself – the thinking level hasn't
-		// been applied yet so pi.getThinkingLevel() still returns the *previous*
-		// mode's value, which would overwrite the target mode's stored level.
+		// Always track the last observed model for overlay/store correctness.
+		lastObservedModel = { provider: event.model.provider, modelId: event.model.id };
+
+		// Skip mode switching triggered by applyMode() itself, otherwise we'd jump to "custom"
+		// while we are in the middle of applying a mode.
 		if (runtime.applying) return;
 
 		// Manual model changes always go into the overlay "custom" mode.
@@ -990,7 +1046,4 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
-		await rememberCurrentSelection(pi, ctx);
-	});
 }
